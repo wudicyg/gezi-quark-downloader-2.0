@@ -21,11 +21,14 @@ jobs:
     name: 构建（Release）
     runs-on: windows-2022
     steps:
+      # 说明：以下 action 版本已选用 node24 运行时（checkout v5 / setup-dotnet v5 /
+      # upload-artifact v6）。不要降级到 v4 —— 它们跑在已被 GitHub 弃用的 node20 上，
+      # 会被强制切到 node24 并产生弃用告警，未来 node20 移除后会直接失败。
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 安装 .NET SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '9.0.x'
 
@@ -50,7 +53,7 @@ jobs:
           Write-Host "全部必需产物就位"
 
       - name: 上传构建产物（供排查用）
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: GeZi-build
           path: src/GeZi/bin/Release/net48/

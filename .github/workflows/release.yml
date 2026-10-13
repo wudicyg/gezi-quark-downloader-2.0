@@ -24,13 +24,14 @@ jobs:
     name: 打包并发布
     runs-on: windows-2022
     steps:
+      # 与 ci.yml 保持一致：使用 node24 运行时版本，勿降级到 v4（node20 已弃用）。
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: 安装 .NET SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '9.0.x'
 
