@@ -18,6 +18,11 @@ env:
   DOTNET_CLI_TELEMETRY_OPTOUT: '1'
   DOTNET_NOLOGO: '1'
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+  # pack.py 会打印中文提示，而 Windows runner 上被重定向的 stdout 默认使用
+  # 系统 ANSI 代码页（cp1252），会抛 UnicodeEncodeError 让发版步骤假失败。
+  # pack.py 内部已自行 reconfigure 到 UTF-8，这里从环境层再兜一道。
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
 
 jobs:
   release:

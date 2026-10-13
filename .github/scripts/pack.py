@@ -14,6 +14,26 @@ import pathlib
 import sys
 import zipfile
 
+# 【2026-10-13 修复】强制 stdout/stderr 走 UTF-8。
+#
+# 背景：本脚本在本地（终端为 UTF-8）一切正常，但在 GitHub Actions 的
+# Windows runner 上首次发版时崩溃（run 38347218262）：
+#     UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-3
+# Windows 上被重定向到管道的 stdout 默认使用系统 ANSI 代码页（cp1252 / cp936
+# 等）而非 UTF-8，打印任何中文都会抛异常。
+#
+# ⚠️ 这个异常尤其阴险：它发生在最后一句 print 上，此时 zip **已经写好了**，
+# 却让整个步骤以 exit 1 结束 —— 现场表现为"打包失败"，实际产物完好，
+# 极易把排查方向带偏。故此处从根上杜绝，而不是改掉中文提示。
+#
+# errors="replace" 是第二道保险：即便某些环境 reconfigure 后仍无法编码，
+# 也只会把字符替换成 '?'，绝不至于让发版流程失败。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # 极老的 Python 或已被包装过的流
+        pass
+
 TOP_DIR = "鸽子下载"
 # 顶层必需文件（与原版一致；zxing.xml 为文档，不发）
 TOP_FILES = ["GeZi.exe", "GeZi.Core.dll", "GeZi.exe.config", "zxing.dll"]
