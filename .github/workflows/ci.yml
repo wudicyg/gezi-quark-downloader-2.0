@@ -1,0 +1,57 @@
+name: CI
+
+# 每次推送到 main / PR / 手动触发时：完整构建 + 冒烟检查。
+# 目的：任何提交都必须能通过 Release 构建，防止"本地能跑、发版炸掉"。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+
+jobs:
+  build:
+    name: 构建（Release）
+    runs-on: windows-2022
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: 构建
+        run: dotnet build GeZi.slnx -c Release
+
+      - name: 冒烟检查（产物完整性）
+        shell: pwsh
+        run: |
+          $bin = 'src/GeZi/bin/Release/net48'
+          $required = @(
+            "$bin/GeZi.exe",
+            "$bin/GeZi.Core.dll",
+            "$bin/zxing.dll",
+            "$bin/GeZi.exe.config",
+            "$bin/Runtime/win-x64/python.exe",
+            "$bin/Runtime/win-x64/python313.zip",
+            "$bin/Runtime/win-x64/quark_cookie_helper.py"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw "产物缺失: $($missing -join ', ')" }
+          Write-Host "全部必需产物就位"
+
+      - name: 上传构建产物（供排查用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeZi-build
+          path: src/GeZi/bin/Release/net48/
+          retention-days: 7

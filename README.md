@@ -4,14 +4,18 @@
 > 多线程分片下载、边下边播、多账号管理、深色模式。
 > 基于 **.NET Framework 4.8 + WPF** 开发，**零 NuGet 依赖、可完全离线构建**。
 
+> 📌 **维护说明**：本仓库是**社区维护分支**，经原作者
+> [huaotem-bot](https://github.com/huaotem-bot/gezi-quark-downloader) 授权后进行
+> 缺陷修复、增强与长期维护。**下载请以本仓库 [Releases](https://github.com/wudicyg/gezi-quark-downloader-2.0/releases) 为准**。
+
 <p align="center">
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
 </p>
 <p align="center">
-  <img src="https://img.shields.io/github/repo-size/huaotem-bot/gezi-quark-downloader?style=social" alt="Repo Size">
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=huaotem-bot.gezi-quark-downloader&radius=12" alt="Visitors">
-  <img src="https://img.shields.io/github/license/huaotem-bot/gezi-quark-downloader?style=social" alt="License">
-  <img src="https://img.shields.io/github/stars/huaotem-bot/gezi-quark-downloader?style=social" alt="Stars">
+  <img src="https://img.shields.io/github/repo-size/wudicyg/gezi-quark-downloader-2.0?style=social" alt="Repo Size">
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=wudicyg.gezi-quark-downloader-2.0&radius=12" alt="Visitors">
+  <img src="https://img.shields.io/github/license/wudicyg/gezi-quark-downloader-2.0?style=social" alt="License">
+  <img src="https://img.shields.io/github/stars/wudicyg/gezi-quark-downloader-2.0?style=social" alt="Stars">
 </p>
 
 ---
@@ -62,7 +66,7 @@
 
 ### 方式一：下载发行版（推荐）
 
-1. 从 [Releases](https://github.com/huaotem-bot/gezi-quark-downloader/releases) 下载 `GeZi-v2.2.0-win64.zip` 并解压到任意目录
+1. 从 [Releases](https://github.com/wudicyg/gezi-quark-downloader-2.0/releases) 下载最新的 `GeZi-v*-win64.zip` 并解压到任意目录
 2. 双击 `GeZi.exe` 即可运行
 3. 若系统缺少 .NET Framework 4.8，Windows 会弹窗提示，按引导安装即可
 
@@ -72,8 +76,8 @@
 
 ```bash
 # 1. 克隆仓库
-git clone <仓库地址>
-cd GeZi
+git clone https://github.com/wudicyg/gezi-quark-downloader-2.0.git
+cd gezi-quark-downloader-2.0
 
 # 2. 构建（Release）
 dotnet build GeZi.slnx -c Release

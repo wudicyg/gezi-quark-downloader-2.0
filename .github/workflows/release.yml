@@ -1,0 +1,70 @@
+name: Release
+
+# 打 tag（v*）时：构建 → 打包 zip → 创建 GitHub Release。
+# 发版流程（维护者）：
+#   1. 更新 src/GeZi/GeZi.csproj 与 src/GeZi.Core/GeZi.Core.csproj 里的 <Version>
+#   2. git commit && git push
+#   3. git tag vX.Y.Z && git push origin vX.Y.Z
+#   4. 本工作流自动完成其余步骤
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+
+jobs:
+  release:
+    name: 打包并发布
+    runs-on: windows-2022
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: 构建
+        run: dotnet build GeZi.slnx -c Release
+
+      - name: 版本一致性检查（tag 与 csproj）
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          [xml]$p = Get-Content 'src/GeZi/GeZi.csproj'
+          $ver = $p.Project.PropertyGroup.Version | Select-Object -First 1
+          Write-Host "tag=$tag  csproj Version=$ver"
+          if ("v$ver" -ne $tag) {
+            Write-Host "::warning::tag（$tag）与 csproj 版本（v$ver）不一致，请确认是否漏改版本号"
+          }
+
+      - name: 打包（zip，含内置运行时）
+        shell: pwsh
+        run: python .github/scripts/pack.py "${{ github.ref_name }}"
+
+      - name: 创建 / 更新 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = "GeZi-$tag-win64.zip"
+          if (-not (Test-Path $zip)) { throw "打包产物缺失: $zip" }
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag 已存在，上传/覆盖资产"
+            gh release upload $tag $zip --clobber
+          } else {
+            Write-Host "创建 Release $tag"
+            gh release create $tag $zip --title "鸽子下载 $tag" --generate-notes
+          }
