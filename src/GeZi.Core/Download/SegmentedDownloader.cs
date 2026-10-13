@@ -139,6 +139,32 @@ namespace GeZi.Core.Download
         private const int MaxSegmentRetries = 4;
 
         /// <summary>
+        /// 【2026-10-13 新增】单个分片在整个任务里最多被"整轮重试"几次。
+        ///
+        /// 背景：一个分片把 <see cref="MaxSegmentRetries"/> 次尝试用完（网络抖动、
+        /// 服务端掐连接、节点坏掉）之后，原来的处理是**抛弃这一片 + 干掉这个 worker**。
+        /// 试验台实测（resetmid 场景）：5 个分片被连续掐断 → 8 个 worker 全部阵亡 →
+        /// 64 片里有 56 片**一次都没被尝试过**，整包下载直接失败 ——
+        /// 一个分片取不到，代价是整包失败，而且报错只有一句没有上下文的
+        /// "HttpRequestException"。
+        ///
+        /// 现在的做法是把这片**放回队列**（换条连接、多半换到别的 CDN 节点），
+        /// worker 留在池子里继续干活（并发不再递减）。
+        /// 3 轮 ≈ 最多 15 次请求/片，足够跨过"某个节点持续坏一段时间"这类现场，
+        /// 又不至于在一颗永久坏掉的树上吊死。
+        /// </summary>
+        private const int MaxPartRounds = 3;
+
+        /// <summary>
+        /// 【2026-10-13 新增】全局"整轮重试"总预算（跨所有分片累计）。
+        ///
+        /// 是 <see cref="MaxPartRounds"/> 之外的第二道闸：如果几百个分片都在反复失败，
+        /// 说明问题不在个别节点（很可能是整条链路/账号层面出事了），
+        /// 此时继续重试只是空转，应当尽快收场并把真实原因告诉用户。
+        /// </summary>
+        private const int MaxTotalRequeues = 500;
+
+        /// <summary>
         /// 真实并发天花板。用户选的档位可以很高，但物理上"同时开着的连接数"
         /// 必须有个上限，否则会把本机网络栈和家用路由器的 NAT 表一起打爆。
         ///
@@ -252,6 +278,32 @@ namespace GeZi.Core.Download
         /// 少于这个数就只做抢占、不做整体限速判定。
         /// </summary>
         private const int PreemptOverallSlowMinSamples = 4;
+
+        /// <summary>
+        /// 【2026-10-13 新增】「连接假死」判定：一条连接连续这么多秒**一个字节都没收到**，
+        /// 就认定这条连接坏了，立即断开重连。
+        ///
+        /// 与"慢"（PreemptMinAgeMs / PreemptMinBps 那一套）有本质区别：
+        /// 慢是服务端限速，重连也没用（所以有"整体限速"判定来避免无谓重连）；
+        /// 假死是连接本身坏了（服务端接了请求却再也不发数据），重连几乎立刻就好。
+        /// 两者必须分开判：假死如果按"慢"走，就会受抢占配额、整体限速判定、
+        /// 剩余量门槛的层层拦截，最后被留在那里永远挂着。
+        ///
+        /// 取 20 秒的依据：正常分片请求的首字节时间是秒级，20 秒还没动静基本可断定
+        /// 对端不会再发了；同时明显小于 45 秒的全局停滞看门狗 —— 能在整个任务被
+        /// 判为停滞之前先自救，用户不会看到"卡一下然后失败"。
+        /// </summary>
+        private const int HangSeconds = 20;
+
+        /// <summary>
+        /// 【2026-10-13 新增】同一个分片最多被判定"假死"抢救多少次。
+        ///
+        /// 必须有上限：若对端对该范围**恒定**假死（不是偶发），无限重连就是空转。
+        /// 12 次 × 20 秒 ≈ 4 分钟，足够覆盖"换了三四个节点还是不给数据"的最坏情况；
+        /// 用完之后的兜底是全局停滞看门狗（它会主动 Dispose 在飞响应，保证任务
+        /// 一定能收场并给出明确原因，而不是像以前那样永远挂住）。
+        /// </summary>
+        private const int MaxHangRescues = 12;
 
         /// <summary>
         /// 单调毫秒时钟。
@@ -1514,14 +1566,44 @@ namespace GeZi.Core.Download
             var wLastW = new long[MaxRealConcurrency];       // 上次采样时的 part.W
             var wLastIdx = new int[MaxRealConcurrency];      // 上次采样时的片索引（换片则重置基线）
             var wCts = new CancellationTokenSource[MaxRealConcurrency];   // 片级取消源
+
+            // 【2026-10-13 新增】本 worker 当前在飞的那个 HTTP 响应对象。
+            //
+            // 为什么必须留着它：.NET Framework 下 HttpClient **一旦收到响应头**，
+            // 之后对内容流的读取就不再受 CancellationToken 约束 —— 实测（试验台
+            // hangall 场景）连接"被接了但一个字节都不发"时，取消令牌完全无效，
+            // worker 永远卡在 ReadAsync 上 → Task.WhenAll 永不返回 → 整个任务
+            // 再也结束不了 → 界面停在「99%、速度 0」永不变化（用户报的卡死）。
+            // 唯一能把它救出来的办法是 Dispose 这个响应（会断掉底层 socket）。
+            var wResp = new HttpResponseMessage[MaxRealConcurrency];
+
+            // 【2026-10-13 新增】本 worker 上一次"确实收到过数据"的时刻。
+            // 与 wLastTick（采样窗口推移）不同：它只在 part.W 真的增长时刷新，
+            // 因此"长时间不刷新"精确等价于"这条连接假死了"。见 PreemptSlowChunks。
+            var wLastGainMs = new long[MaxRealConcurrency];
             for (int i = 0; i < MaxRealConcurrency; i++)
             {
                 wCurPart[i] = -1;
                 wLastIdx[i] = -1;
+                wLastGainMs[i] = NowMs();
             }
             // 按分片索引：该片被抢过几次、上次何时被抢
             var partPreempt = new int[plan.Parts.Count];
             var partLastPreempt = new long[plan.Parts.Count];
+            // 【2026-10-13 新增】按分片索引：该片被判"连接假死"抢救过几次。
+            // 与 partPreempt 分开计数 —— 假死必须不受抢占配额限制（见 HangSeconds 注释）。
+            var partHangRescue = new int[plan.Parts.Count];
+            // 【2026-10-13 新增】按分片索引：该片已经"整轮重试"过几次（见 MaxPartRounds）。
+            var partRounds = new int[plan.Parts.Count];
+            // 全局整轮重试计数（跨分片累计）与"彻底放弃"计数（见 MaxTotalRequeues）。
+            int totalRequeues = 0;
+            int givenUpCount = 0;
+            int partFailRetries = 0;
+            // 第一个"用尽重试预算"的分片错误文案。收尾报错时优先用它 ——
+            // 它才是根因，而"网络停滞"往往只是没人再发数据之后的结果。
+            string firstGiveUp = null;
+            // 第一片"整轮失败"的现场描述（比 firstGiveUp 更早出现，覆盖更常见的现场）。
+            string firstFail = null;
             int preemptedCount = 0;   // 累计抢占次数（收尾诊断用）
             // 各路瞬时速度（两遍扫描用：第一遍采样、第二遍按结果抢占）
             var wInstBps = new long[MaxRealConcurrency];
@@ -1541,6 +1623,63 @@ namespace GeZi.Core.Download
                 for (int i = 0; i < wCurPart.Length; i++)
                     if (Volatile.Read(ref wCurPart[i]) >= 0) inflight++;
                 if (inflight == 0) return;
+
+                // ================= 第零遍：假死连接抢救（最高优先级）=================
+                //
+                // 这一遍刻意放在"相对速度"抢占之前，且不看任何速度阈值、不看整体限速、
+                // 不看剩余量、不占用抢占配额。理由：这里的判据是**一个字节都没来过**，
+                // 它和"这条连接比别的慢"是两码事 ——
+                //   慢   = 服务端限速（重连无用，整体限速判定就是为此存在）
+                //   假死 = 连接坏了（重连几乎必好，越快断越省时间）
+                // 以前的代码把两者混在"按速度抢占"一条路径里，于是假死连接会被
+                // 抢占配额（PreemptMax/PreemptMaxEndgame）和"整体限速"判定拦下来 ——
+                // 试验台实测：尾部那个假死分片被抢占日志刷了 30 次（配额用尽）后
+                // 就再也没人管，整个任务永远停在 63/64（即用户看到的「卡 99%、速度 0」）。
+                //
+                // 【为什么必须 Dispose 响应，不能只 Cancel 令牌】
+                // .NET Framework 下 HttpClient 收到响应头之后，内容流读取**不响应取消令牌**：
+                // Cancel 了 worker 也照样卡在 ReadAsync 上（同一实验里，抢占日志打了 30 次，
+                // 对端却连一个重连请求都没收到 —— worker 根本没醒）。
+                // Dispose 响应会真正断掉底层 socket，那次读才会立刻以异常返回。
+                //
+                // 暂停期间不判定：用户主动暂停时本来就不该有数据，那不是假死。
+                if (pause == null || !pause.IsPaused)
+                {
+                    long nowMsHang = NowMs();
+                    for (int i = 0; i < wCurPart.Length; i++)
+                    {
+                        int hidx = Volatile.Read(ref wCurPart[i]);
+                        if (hidx < 0) continue;
+                        if (nowMsHang - wLastGainMs[i] < HangSeconds * 1000L) continue;
+
+                        // 还没进入读取阶段（正在建连/写盘）的，交给常规逻辑，别误杀。
+                        var hresp = Volatile.Read(ref wResp[i]);
+                        if (hresp == null) continue;
+
+                        if (partHangRescue[hidx] >= MaxHangRescues)
+                        {
+                            // 该片已经抢救够多次，判定为"对端对该范围恒定假死"。
+                            // 不再重连，交给 45 秒全局停滞看门狗收场（它会强制 Dispose
+                            // 在飞响应，保证任务一定能结束并给出明确原因）。
+                            continue;
+                        }
+                        partHangRescue[hidx]++;
+
+                        var pp = plan.Parts[hidx];
+                        Log?.Invoke(string.Format(
+                            "连接假死: 第 {0} 片（{1}/{2} 字节）已 {3} 秒没有收到任何数据，" +
+                            "判定该连接已坏，主动断开重连（第 {4}/{5} 次）。",
+                            hidx, Fmt(pp.W), Fmt(pp.E - pp.S + 1),
+                            (nowMsHang - wLastGainMs[i]) / 1000,
+                            partHangRescue[hidx], MaxHangRescues));
+
+                        wLastGainMs[i] = nowMsHang;   // 重新计时，避免同一轮反复抢救
+                        Interlocked.Increment(ref preemptedCount);
+                        try { hresp.Dispose(); } catch { }          // ← 真正断 socket 的那一下
+                        var hcts = Volatile.Read(ref wCts[i]);
+                        if (hcts != null) { try { hcts.Cancel(); } catch { } }
+                    }
+                }
 
                 // ⚠️ 注意：这里**不能**用 speedBps / inflight 当作"平均单连接速"。
                 //
@@ -1589,6 +1728,7 @@ namespace GeZi.Core.Download
                         wLastIdx[i] = idx;
                         wLastTick[i] = nowMs;
                         wLastW[i] = w;
+                        wLastGainMs[i] = nowMs;    // 新一次尝试 → 假死计时重新开始
                         wInstBps[i] = -1;      // -1 = 本轮无有效样本
                         continue;
                     }
@@ -1596,9 +1736,13 @@ namespace GeZi.Core.Download
                     long dtMs = nowMs - wLastTick[i];
                     if (dtMs <= 0) { wInstBps[i] = -1; continue; }
 
-                    long instBps = (long)((w - wLastW[i]) * 1000.0 / dtMs);
+                    long wPrev = wLastW[i];
+                    long instBps = (long)((w - wPrev) * 1000.0 / dtMs);
                     wLastTick[i] = nowMs;      // 采样窗口照常推进（下一轮仍是 5 秒窗口）
                     wLastW[i] = w;
+                    // 确实收到过数据 → 刷新"最后有数据"的时刻（假死判定的唯一依据）
+                    if (w > wPrev)
+                        wLastGainMs[i] = nowMs;
 
                     // 【关键】年龄不够的**既不计入统计、也不参与抢占**：
                     // 刚建立的连接还没跑起来，瞬时速度天然接近 0，
@@ -1902,6 +2046,20 @@ namespace GeZi.Core.Download
                             // 必须真的掐断令牌：否则卡在 ReadAsync 上的 worker
                             // 会一直等到 TCP 超时，界面继续假死。
                             try { watchdog.Cancel(); } catch { }
+
+                            // 【2026-10-13 新增·收场保证】光取消令牌是不够的：
+                            // .NET Framework 下 HttpClient 收到响应头之后，内容流读取不响应
+                            // 取消令牌（试验台实测：卡在 ReadAsync 上的 worker 对 Cancel 毫无反应）。
+                            // 所以这里把在飞响应逐个 Dispose，真正断掉底层 socket。
+                            // 有这一下才能保证"判定停滞"一定能把任务收回来 —— 否则
+                            // Task.WhenAll 永不返回、任务永不结束，界面就永远停在那一帧
+                            // （用户报的「卡 99%、速度 0、再也回不来」正是这个）。
+                            for (int wr = 0; wr < wResp.Length; wr++)
+                            {
+                                var r0 = Volatile.Read(ref wResp[wr]);
+                                if (r0 == null) continue;
+                                try { r0.Dispose(); } catch { }
+                            }
                         }
 
                         if ((now - lastSave).TotalSeconds >= 1.0)
@@ -2112,16 +2270,33 @@ namespace GeZi.Core.Download
                 // ---- 限流制动 ----
                 // 连接开得多有利于跑满带宽，但也更容易把服务端惹毛（429/503）。
                 // 这里做一个"自动缩缸"：一旦观察到限流类错误，就把并发闸门收窄，
-                // 避免重试风暴把配额彻底耗光。缩缸只缩不放，保证任务能跑完。
-                var gate = new SemaphoreSlim(workerCount);
+                // 避免重试风暴把配额彻底耗光；限流平息后再把它放回去。
+                //
+                // 【2026-10-13 重写】原来这整段是"SemaphoreSlim + 偷票"实现的，
+                // 有两个实测出来的严重缺陷（详见 ThrottleGate 的类注释）：
+                //   ① 并发会**永久**掉下去：偷走的票只能靠"每 30 秒静默补一张"慢慢还，
+                //      限流持续期间那 30 秒静默永远不成立 → 再也回不来；
+                //   ② 没有去抖：一次风控会同时命中几十条在飞连接，每条都调一次
+                //      OnThrottled，每次都砍 30% —— 实测 64 路在 **0.35 秒内**
+                //      被砍成 44→30→21→14→9→6→4（下限），此后整段下载只有 4 路，
+                //      同一个文件从 2.8 秒变成 10.3 秒。这正是用户说的"越下越慢/卡住"。
+                // 现在：闸门状态唯一（ThrottleGate.Limit），收窄与回升同一路径；
+                // 并且一波风控只收窄一次。
+                var gate = new ThrottleGate(workerCount);
                 int throttleHits = 0;
-                int gateLimit = workerCount;
-                object gateLock = new object();
                 // 最近一次被限流的时刻（TickCount）。用于"限流平息后把并发放回去"。
-                long lastThrottleMs = Environment.TickCount;
-                // 连续多久没再被限流就往上加 1 路。取得比较长（30 秒 ≈ 6 个采样轮）
+                int lastThrottleMs = Environment.TickCount;
+                // 最近一次**实际收窄**的时刻。用于把"同一波风控"去抖成一次。
+                int lastShrinkMs = 0;
+                // 连续多久没再被限流才开始往上放。取得比较长（30 秒 ≈ 6 个采样轮）
                 // 是有意的：放回去太急会立刻又被限流，来回抖比一直低并发更糟。
                 const int GateRecoverQuietMs = 30000;
+                // 同一波风控的去抖窗口。一次风控（例如一次配额耗尽）通常会在几秒内
+                // 命中大量并发连接；窗口取 15 秒，让"真·第二次风控"仍能被识别，
+                // 而"同一波的几十次回调"只算一次。
+                const int ThrottleShrinkCooldownMs = 15000;
+                // 收窄下限：再糟也要保留几路，否则等于把任务停掉。
+                const int ThrottleFloor = 4;
 
                 // ---- 限流平息 → 把并发放回去 ----
                 // 【2026-10-04 用户反馈】「为什么文件下到最后越来越慢」。
@@ -2129,6 +2304,9 @@ namespace GeZi.Core.Download
                 // 最低砍到 4 路，然后**整个任务余下时间就一直是 4 路** ——
                 // 于是"前段飞快、后段龟速"，看起来就是越下越慢且再也快不起来。
                 // 缩缸本身是对的（避免重试风暴），但缺了对称的那一半，这里补上。
+                //
+                // 【2026-10-13】回升改成"按比例"（每次 +1/4），否则从 4 路爬回 512 路
+                // 要四个多小时 —— 对长下载等于永远回不去。
                 // （必须单独起任务：PreemptSlowChunks 定义在 gate 声明之前，作用域拿不到。）
                 var gateRecoverTask = Task.Run(async () =>
                 {
@@ -2137,55 +2315,43 @@ namespace GeZi.Core.Download
                         try { await Task.Delay(GateRecoverQuietMs, cancelToken).ConfigureAwait(false); }
                         catch { return; }
 
-                        lock (gateLock)
-                        {
-                            if (gateLimit < workerCount
-                                && Environment.TickCount - lastThrottleMs >= GateRecoverQuietMs)
-                            {
-                                gateLimit++;
-                                try { gate.Release(); } catch { }
-                                lastThrottleMs = Environment.TickCount;   // 重新计时
-                                Log?.Invoke("限流已平息，下载并发回升到 " + gateLimit
-                                    + " 路（上限 " + workerCount + " 路）。");
-                            }
-                        }
+                        if (Environment.TickCount - Volatile.Read(ref lastThrottleMs) < GateRecoverQuietMs)
+                            continue;
+
+                        int cur = gate.Limit;
+                        if (cur >= workerCount)
+                            continue;
+
+                        int next = Math.Min(workerCount, cur + Math.Max(1, cur / 4));
+                        gate.SetLimit(next);
+                        Volatile.Write(ref lastThrottleMs, Environment.TickCount);   // 重新计时
+                        Log?.Invoke("限流已平息，下载并发回升到 " + next
+                            + " 路（上限 " + workerCount + " 路）。");
                     }
                 }, cancelToken);
 
                 void OnThrottled()
                 {
-                    lock (gateLock)
-                    {
-                        throttleHits++;
-                        lastThrottleMs = Environment.TickCount;
-                        // 每次限流把闸门砍掉 30%，最低保留 4 路
-                        int next = Math.Max(4, (int)(gateLimit * 0.7));
-                        int want = gateLimit - next;        // 这次想收掉的票数
-                        if (want <= 0)
-                            return;
+                    Interlocked.Increment(ref throttleHits);
+                    int nowTick = Environment.TickCount;
+                    Volatile.Write(ref lastThrottleMs, nowTick);
 
-                        // 【不要用 gate.Wait()】原实现是 Wait() + Release(差额)，
-                        // 但 Wait() 会**阻塞**直到有一张票可用。而它是在
-                        // lock(gateLock) 里同步调用的，触发时机恰恰是限流时 ——
-                        // 此时票最可能被占满，于是这里会阻塞，还握着 gateLock
-                        // 让别的 worker 排队，属于真实死锁风险。
-                        //
-                        // 改成非阻塞回收：Wait(0) 立即返回，最多收 want 张票。
-                        // 收不满也没关系（说明票正在被使用），gateLimit 仍然下调，
-                        // 后续 worker 释放时按新上限放行，效果一致。
-                        int taken = 0;
-                        while (taken < want && gate.Wait(0))
-                            taken++;
+                    // ---- 去抖：一波风控只收窄一次 ----
+                    // 用 Exchange 而不是"读-判-写"：多个 worker 会**同时**拿到 429，
+                    // 必须保证只有一个线程能通过这道闸。
+                    int prevShrink = Interlocked.Exchange(ref lastShrinkMs, nowTick);
+                    if (nowTick - prevShrink < ThrottleShrinkCooldownMs)
+                        return;
 
-                        // 只把"多出来的"票放回：原来已发出的票里，超出新上限的部分不再续摊。
-                        // 这里不额外 Release —— 因为 gateLimit 已降为 next，
-                        // 而当前信号量计数 = workerCount - (仍被持有的票)，
-                        // 后续按新上限自然收敛。
-                        gateLimit = next;
-                        Log?.Invoke(string.Format(
-                            "检测到服务端限流（第 {0} 次），下载并发自动收窄到 {1} 路以避免触发更严格的风控。",
-                            throttleHits, gateLimit));
-                    }
+                    int cur = gate.Limit;
+                    int next = Math.Max(ThrottleFloor, cur - Math.Max(1, cur / 4));
+                    if (next >= cur)
+                        return;
+
+                    gate.SetLimit(next);
+                    Log?.Invoke(string.Format(
+                        "检测到服务端限流（第 {0} 次），下载并发自动收窄到 {1} 路以避免触发更严格的风控。",
+                        Volatile.Read(ref throttleHits), next));
                 }
 
                 var workers = new Task[workerCount];
@@ -2245,6 +2411,10 @@ namespace GeZi.Core.Download
                                 Volatile.Write(ref wLastTick[workerNo], NowMs());
                                 Volatile.Write(ref wLastW[workerNo], part.W);
                                 Volatile.Write(ref wLastIdx[workerNo], idx);
+                                // 假死计时从"领到这片"开始算；上一片的响应对象必须先清掉，
+                                // 否则看门狗会拿一个已作废的响应去 Dispose。
+                                Volatile.Write(ref wLastGainMs[workerNo], NowMs());
+                                Volatile.Write(ref wResp[workerNo], null);
 
                                 // 单个分片独立重试：网络抖动不应该让整个任务失败。
                                 // 指数退避 + 抖动，最多 MaxSegmentRetries 次。
@@ -2310,6 +2480,10 @@ namespace GeZi.Core.Download
                                         using (var req = BuildRequest(HttpMethod.Get, url, h))
                                         using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, partToken).ConfigureAwait(false))
                                         {
+                                            // 【2026-10-13 新增】把在飞响应登记给进度线程。
+                                            // 看门狗判定"连接假死"时要靠它 Dispose 来断 socket ——
+                                            // 取消令牌做不到这一点（详见 PreemptSlowChunks）。
+                                            Volatile.Write(ref wResp[workerNo], resp);
                                             int code = (int)resp.StatusCode;
                                             if (code == 200 && !(reqStart == 0 && part.E >= total - 1))
                                             {
@@ -2443,20 +2617,94 @@ namespace GeZi.Core.Download
                                     }
                                     catch (Exception ex)
                                     {
+                                        // 【2026-10-13 新增·关键】抢占/看门狗抢救走的是
+                                        // **Dispose 响应**（取消令牌对内容流读取无效），
+                                        // 因此抛出来的异常类型不可预测 —— 可能是
+                                        // ObjectDisposedException / IOException / WebException，
+                                        // 而不是 OperationCanceledException。
+                                        // 若这里按"传输失败"处理，被抢救的那一片就会被记成失败
+                                        // 并进入退避重试，纯属误判。所以判据只能是**令牌状态**。
+                                        if (partToken.IsCancellationRequested && !cancelToken.IsCancellationRequested)
+                                        {
+                                            queue.Enqueue(idx);
+                                            Interlocked.Increment(ref preemptedCount);
+                                            lastErr = null;
+                                            break;   // 回队列，换一条连接（多半换到别的节点）接着下
+                                        }
+                                        if (cancelToken.IsCancellationRequested)
+                                        {
+                                            Interlocked.Exchange(ref cancelled, 1);
+                                            if (cancel.IsCancellationRequested)
+                                                Interlocked.Exchange(ref userCancelled, 1);
+                                            return;
+                                        }
                                         lastErr = ex.GetType().Name + ": " + ex.Message;
                                     }
                                 }
 
                                 if (lastErr != null)
                                 {
-                                    AddError(lastErr);
-                                    return;
+                                    // 【2026-10-13 重写·这是「下载到一半整包失败」的主因】
+                                    //
+                                    // 原来这里是 `AddError(lastErr); return;` ——
+                                    //   ① 这片**不再入队**（永久丢掉）；
+                                    //   ② 这个 worker **永久退出**（池子少一路，越到后面并发越低）。
+                                    // 试验台实测（resetmid 场景，5 个分片被服务端连续掐断）：
+                                    // 8 个 worker 全部阵亡 → 64 片里有 **56 片一次都没被尝试过**
+                                    // → 整包下载直接失败，而报错只有一句没有上下文的
+                                    // "HttpRequestException"。一个分片取不到，代价是整包失败。
+                                    //
+                                    // 现在的做法：把这片**放回队列**（换条连接，多半换到别的节点），
+                                    // 自己继续去领下一片 —— 并发不递减，缺的那片也有人接着补。
+                                    // 只有把整轮重试预算用尽才记终态错误，且 worker 依然不退出。
+                                    int round = partRounds[idx] + 1;
+                                    if (round <= MaxPartRounds
+                                        && Interlocked.Increment(ref totalRequeues) <= MaxTotalRequeues
+                                        && !cancelToken.IsCancellationRequested)
+                                    {
+                                        partRounds[idx] = round;
+                                        Interlocked.Increment(ref partFailRetries);
+                                        string failMsg = string.Format(
+                                            "第 {0} 片（{1}/{2} 字节）连续 {3} 次尝试都失败（{4}）",
+                                            idx, Fmt(part.W), Fmt(segSize), MaxSegmentRetries + 1,
+                                            Trim(lastErr, 60));
+                                        // 记下第一片反复失败的现场。收尾时若被判"停滞"，
+                                        // 用它说明真实原因 —— 否则用户只会看到一句笼统的
+                                        // "网络停滞"，完全不知道其实只是某几片取不到。
+                                        Interlocked.CompareExchange(
+                                            ref firstFail, failMsg + "，已换新连接重试", null);
+                                        Log?.Invoke("分片重试: " + failMsg
+                                            + "，已换新连接重试（第 " + round + "/" + MaxPartRounds + " 轮）。");
+                                        queue.Enqueue(idx);
+                                        continue;      // finally 会归还闸门，然后回去领下一片
+                                    }
+
+                                    // 重试预算用尽 → 记终态错误（含分片区间与"断点已保留"提示，
+                                    // 用户据此知道重试能接着下，而不是以为文件坏了）。
+                                    string giveUp = string.Format(
+                                        "第 {0} 片（{1}-{2}）重试 {3} 轮共 {4} 次仍失败: {5}。" +
+                                        "已下载的部分与断点都已保留，重试可续传。",
+                                        idx, plan.Parts[idx].S, plan.Parts[idx].E,
+                                        MaxPartRounds, (MaxPartRounds + 1) * (MaxSegmentRetries + 1),
+                                        Trim(lastErr, 80));
+                                    // 记下**第一个**放弃的分片：它是根因，后面那条
+                                    // "网络停滞"只是它的后果（已经没人再发数据了）。
+                                    // 收尾报错时优先用它，用户才知道到底哪一片出的问题。
+                                    Interlocked.CompareExchange(ref firstGiveUp, giveUp, null);
+                                    if (Interlocked.Increment(ref givenUpCount) <= 20)
+                                        AddError(giveUp);
+                                    // ⚠️ 注意这里**不 return**：worker 继续去领别的分片。
+                                    // 原来的 return 会让并发随失败次数递减，
+                                    // 直接放大成"越下越慢、最后停住"。
                                 }
                             }
                             finally
                             {
                                 // 本片结束（无论完成/失败/被抢占），都要把采样状态清掉，
                                 // 否则看门狗会拿一个已失效的 worker 编号去判定。
+                                // wResp 必须先清：假死抢救会读它并 Dispose，
+                                // 留着一个已作废的响应只会让看门狗空放一枪。
+                                Volatile.Write(ref wResp[workerNo], null);
                                 Volatile.Write(ref wCts[workerNo], null);
                                 Volatile.Write(ref wCurPart[workerNo], -1);
                                 if (pcts != null)
@@ -2514,6 +2762,23 @@ namespace GeZi.Core.Download
                         //   同样必须保留进度 —— 这部分以前会误删，属真实缺陷。
                         if (stalledFlag != 0)
                         {
+                            // 【2026-10-13】若其实已经有分片"用尽重试预算"，那才是根因：
+                            // 停滞只是它的后果 —— 没有人再发数据，自然就停滞了。
+                            // 优先报那个更精确的原因（含分片区间），用户才知道问题在哪。
+                            var gu = Volatile.Read(ref firstGiveUp);
+                            if (gu != null)
+                                return (false, gu);
+                            // 还没用尽预算、但已经有分片在反复失败（更常见的现场）：
+                            // 同样要如实说明 —— 否则用户只看到笼统的"网络停滞"，
+                            // 会误以为是自己网络的问题，而真相是某几片取不到数据。
+                            var ff = Volatile.Read(ref firstFail);
+                            if (ff != null)
+                            {
+                                return (false, string.Format(
+                                    "收尾停滞: {0}（共自动重试 {1} 次仍未成功）。" +
+                                    "已下载的部分与断点都已保留，重试可续传（重试通常会换到更快的节点）。",
+                                    ff, Volatile.Read(ref partFailRetries)));
+                            }
                             return (false, "网络停滞已中止（已保留断点，降低线程数后重试可续传）");
                         }
                         if (userCancelled == 0)
@@ -2656,12 +2921,28 @@ namespace GeZi.Core.Download
                             Fmt((long)perConn)));
                     }
 
+                    // 【2026-10-13 新增】分片级失败的自愈情况。
+                    // 用户以前看到的只有"整包失败"，完全不知道那只是个别坏节点；
+                    // 这行把"引擎自己修好了"这件事明确说出来。
+                    int pfRetries = Volatile.Read(ref partFailRetries);
+                    if (pfRetries > 0)
+                    {
+                        int pfGiveUp = Volatile.Read(ref givenUpCount);
+                        Log?.Invoke(pfGiveUp == 0
+                            ? string.Format(
+                                "分片重试: 有 {0} 个分片在首次尝试失败后被放回队列重取，最终全部补齐，未影响整包。",
+                                pfRetries)
+                            : string.Format(
+                                "分片重试: 有 {0} 个分片被放回队列重取，其中 {1} 个用尽重试预算仍未成功。",
+                                pfRetries, pfGiveUp));
+                    }
+
                     if (throttleHits > 0)
                     {
                         Log?.Invoke(string.Format(
                             "建议: 本次触发了 {0} 次服务端限流，并发被压到 {1} 路。" +
                             "说明 {2} 路超出了你当前网络/账号的承受范围，下次直接选更低的档位会更稳。",
-                            throttleHits, gateLimit, _threads));
+                            Volatile.Read(ref throttleHits), gate.Limit, _threads));
                     }
                     else if (avgSpeed > 0)
                     {
