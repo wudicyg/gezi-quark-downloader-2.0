@@ -273,6 +273,26 @@ namespace GeZi
             // 加载完成后再提示未完成任务（此时窗口已就绪，弹窗才有 Owner）
             Loaded += (s, e) =>
             {
+                // ---- 【2026-10-13 新增】记录渲染环境 ----
+                // 用户反馈"界面白屏 / 画不出来 / 点不动"时，日志里这一行能直接回答：
+                // 是不是跑在远程桌面里、有没有被强制软件渲染、DPI 缩放是多少。
+                // 没有这行信息，这类问题只能靠反复追问用户环境，排查效率极低。
+                try
+                {
+                    double dpiScale = 1.0;
+                    var src = System.Windows.PresentationSource.FromVisual(this);
+                    if (src != null && src.CompositionTarget != null)
+                        dpiScale = src.CompositionTarget.TransformToDevice.M11;
+                    Log(string.Format(
+                        "渲染环境: {0}；DPI 缩放 {1:0.##}x；远程桌面会话 {2}",
+                        App.SoftwareRenderingForced
+                            ? "已强制软件渲染（检测到远程桌面，用于规避白屏）"
+                            : "硬件渲染（WPF 自动选择）",
+                        dpiScale,
+                        App.SoftwareRenderingForced ? "是" : "否"));
+                }
+                catch { }
+
                 // 确保主窗真的显示在最前。此前的现象是"托盘有图标但主窗不弹出"，
                 // 根因在单实例激活逻辑（见 App.ActivateExistingInstance），这里再兜一道：
                 // 即便窗口因任何原因处于隐藏/最小化，也强制恢复。
@@ -294,7 +314,24 @@ namespace GeZi
                 // 用户会误以为"程序没打开"（尤其弹框被主窗或别的窗口挡住时）。
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    try { ShowPendingOnStartup(); } catch { }
+                    try
+                    {
+                        ShowPendingOnStartup();
+                    }
+                    catch (Exception ex)
+                    {
+                        // 【2026-10-13】原来这里是 `catch { }` 静默吞掉 ——
+                        // 若对话框构建过程出任何岔子，用户什么都看不到、日志也什么都没有
+                        //（"点了没反应/弹不出来"类的无头案就是这么来的）。
+                        // 改为记日志：不影响其它功能，但给排查留证据（用户可复制日志反馈）。
+                        Log("未完成任务提示窗构建失败（已跳过，不影响其它功能）: " + ex.Message);
+                    }
+                    finally
+                    {
+                        // 启动弹窗流程结束后刷新工具栏按钮（有任务时才显示）。
+                        // 这个常驻入口是弹窗异常/被跳过时的兜底通道（见 OnOpenPending 注释）。
+                        UpdatePendingButton();
+                    }
                 }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
 
                 // 窗口圆角（用户反馈「整个软件窗口四个角太尖了，微微加一些圆角」）。
@@ -2523,6 +2560,19 @@ namespace GeZi
         private string _pendingSig;
 
         /// <summary>
+        /// 【2026-10-13 新增】本次运行中「未完成的任务」对话框的渲染自检结果。
+        /// <c>null</c> = 还没试过；<c>true</c> = 渲染正常；<c>false</c> = 出现过白屏。
+        ///
+        /// <para>一旦判定为 <c>false</c>，后续（包括用户点下载页工具栏的「未完成任务」
+        /// 按钮）就**直接走兼容模式**，不再去撞同一个坑 —— 否则用户每点一次都要再等
+        /// 6 秒自检、再看一次白屏，等于这个功能彻底不可用。</para>
+        ///
+        /// <para>用 static 是有意的：它刻画的是"这台机器 + 这套渲染环境"的性质，
+        /// 与具体窗口实例无关；重建窗口也不该让结论失效。</para>
+        /// </summary>
+        private static bool? _pendingDlgRenderOk;
+
+        /// <summary>
         /// 把当前"未完成"的任务（排队/下载/暂停）写进持久化记录，
         /// 已完成的从记录里移除。供下次启动提示"有 N 个未完成任务"。
         ///
@@ -2567,6 +2617,8 @@ namespace GeZi
                     return;
                 _pendingSig = sig;
                 HistoryStore.SetPending(list);
+                // 工具栏「未完成任务」按钮跟随刷新（有任务才显示、带数量）。
+                UpdatePendingButton(list.Count);
             }
             catch { }
         }
@@ -2727,6 +2779,57 @@ namespace GeZi
             }
             SyncPending();
             UpdatePauseAllButton(force: true);
+        }
+
+        /// <summary>
+        /// 【2026-10-13 新增】下载页工具栏「未完成任务」按钮 —— 打开与启动时相同的续传对话框。
+        ///
+        /// <para>【为什么必须有这个常驻入口】</para>
+        /// <para>
+        /// 此前「未完成的任务」只有一个入口：**启动时自动弹出的模态对话框**。
+        /// 而一旦该弹窗在某些环境上发生"窗口显示但内容空白"（WPF 渲染异常，
+        /// 见 ShowPendingOnStartup 里渲染自检的注释），用户既看不到内容、又挡在主界面前，
+        /// 重启依旧如此 —— 这就是 issue #8 的「重启后的续传界面卡白屏，再也进不去」。
+        /// 有了这个常驻按钮：即使弹窗被跳过/失败，用户也永远有一条路走回续传流程。
+        /// </para>
+        /// </summary>
+        private void OnOpenPending(object sender, RoutedEventArgs e)
+        {
+            try { ShowPendingOnStartup(); }
+            catch (Exception ex)
+            {
+                Log("打开「未完成的任务」失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 【2026-10-13 新增】刷新「未完成任务」按钮的可见性与计数文案。
+        /// 有未完成任务记录 → 显示「未完成任务 (N)」；没有 → 隐藏。
+        /// </summary>
+        /// <param name="countOverride">已知的数量（如 SyncPending 里刚算过），
+        /// 传 null 则现读持久化文件。</param>
+        private void UpdatePendingButton(int? countOverride = null)
+        {
+            try
+            {
+                int n = countOverride ?? HistoryStore.GetPending().Count;
+                var vis = n > 0 ? Visibility.Visible : Visibility.Collapsed;
+                string label = n > 0 ? "未完成任务 (" + n + ")" : "未完成任务";
+
+                // 任务页入口
+                if (PendingBtn != null)
+                    PendingBtn.Visibility = vis;
+                if (PendingBtnText != null)
+                    PendingBtnText.Text = label;
+
+                // 下载页入口（【2026-10-13】启动后用户默认就停在下载页 ——
+                // 续传弹窗白屏、被跳过、或已被自动关闭时，这是他第一眼该看到的东西）
+                if (PendingBtnHome != null)
+                    PendingBtnHome.Visibility = vis;
+                if (PendingBtnHomeText != null)
+                    PendingBtnHomeText.Text = label;
+            }
+            catch { /* 纯装饰性刷新，任何异常都不该影响主流程 */ }
         }
 
         // ---------------- 任务列表右键菜单（单任务操作） ----------------
@@ -3706,6 +3809,31 @@ namespace GeZi
             var resumable = all.Where(p => p != null && p.CanResume).ToList();
             var notResumable = all.Where(p => p == null || !p.CanResume).ToList();
 
+            // ---- 【2026-10-13 新增】已知本机渲染异常 → 直接上兼容模式 ----
+            // 理由见 _pendingDlgRenderOk 的注释：不再让用户白等一次 6 秒自检 + 白屏。
+            // 兼容模式用的是最朴素的窗口/控件，完全不碰主题资源与 DWM，最不容易出问题。
+            //
+            // 另附一个**手动逃生通道**：环境变量 GEZI_PENDING_COMPAT=1 可强制走兼容模式。
+            // 用途：① 让自动化测试能稳定走到这条路径 —— 否则它只在"用户真的白屏"时才
+            //        被触发，等于永远没被验证过；② 万一某台机器连正常版都画不出来，
+            //        用户可以这样启动，立刻绕开问题拿到续传能力。
+            bool forceCompat = false;
+            try
+            {
+                string envCompat = Environment.GetEnvironmentVariable("GEZI_PENDING_COMPAT");
+                forceCompat = !string.IsNullOrEmpty(envCompat) && envCompat != "0";
+            }
+            catch { }
+
+            if (forceCompat || _pendingDlgRenderOk == false)
+            {
+                Log(forceCompat
+                    ? "已按环境变量 GEZI_PENDING_COMPAT 强制使用兼容模式显示「未完成的任务」。"
+                    : "「未完成的任务」对话框在本机此前已判定渲染异常，本次直接使用兼容模式显示。");
+                ShowPendingFallbackAndApply(all, resumable);
+                return;
+            }
+
             var dlg = new Window
             {
                 Owner = this,
@@ -3806,7 +3934,60 @@ namespace GeZi
             // 误读成"有默认勾选"）。勾选完全交给用户，按钮状态跟着走。
             syncResumeBtn();
 
-            dlg.ShowDialog();
+            // ---- 【2026-10-13 新增】渲染自检：防止「白屏死局」 ----
+            //
+            // 背景（原作者仓库 issue #8）：「重启后的续传界面卡白屏，再也进不去」。
+            // 少数环境下，这个模态对话框会出现"窗口显示、标题栏正常、内容全白"
+            // （WPF 渲染队列异常 / GPU 故障的典型表现 —— 逻辑树存在但视觉永不提交）。
+            // 因为它是**模态**的，用户点不到任何按钮、不知道发生了什么，
+            // 等于整个程序被一个白窗口卡死；重启后弹的还是它。
+            //
+            // 自检原理：ContentRendered 在窗口内容完成**首次渲染**后触发。
+            // 正常情况亚秒级触发；若 6 秒仍未触发，判定渲染异常 →
+            // 自动关掉对话框，让用户回到主界面。
+            //（日志留说明；主界面下载页工具栏有「未完成任务」常驻入口，随时能找回续传。）
+            //
+            // ⚠️ 覆盖范围：能救"UI 线程活着、只是渲染没提交"的场景（用户截图正是这种）。
+            //    若 UI 线程被彻底死锁（连消息循环都停了），任何同线程自检都无从谈起 ——
+            //    但那属于另一类故障，且此时窗口根本不会显示出来（构建阶段就卡住了）。
+            bool contentRendered = false;
+            bool renderFailed = false;
+            dlg.ContentRendered += (s, e) => { contentRendered = true; };
+            var renderWatchdog = new System.Windows.Threading.DispatcherTimer(
+                TimeSpan.FromSeconds(6),
+                System.Windows.Threading.DispatcherPriority.Normal,
+                (s, e) =>
+                {
+                    ((System.Windows.Threading.DispatcherTimer)s).Stop();
+                    if (contentRendered || !dlg.IsVisible) return;
+                    renderFailed = true;
+                    Log("「未完成的任务」对话框在 6 秒内未完成内容渲染（本机渲染环境异常），"
+                        + "已自动关闭并改用兼容模式重开。");
+                    try { dlg.Close(); } catch { }
+                },
+                Dispatcher);
+            renderWatchdog.Start();
+
+            try
+            {
+                dlg.ShowDialog();
+            }
+            finally
+            {
+                renderWatchdog.Stop();
+            }
+
+            // ---- 【2026-10-13 新增】自检判定渲染异常 → 记住，并立刻用兼容模式重来一次 ----
+            // ⚠️ 只把白窗口关掉是不够的：用户**还是进不去续传**，功能等于没有。
+            //    必须马上给一个"一定画得出来"的替代界面，让用户当场就能操作。
+            if (renderFailed)
+            {
+                _pendingDlgRenderOk = false;
+                ShowPendingFallbackAndApply(all, resumable);
+                return;
+            }
+            // 走完整流程且首帧渲染正常 → 记住这个结论，后续直接用正常版（省掉 6 秒自检）。
+            _pendingDlgRenderOk = true;
 
             if (doDiscard)
             {
@@ -3851,6 +4032,7 @@ namespace GeZi
                 }
                 HistoryStore.ClearPending();
                 _pendingSig = null;
+                UpdatePendingButton(0);
                 Log(failed == 0
                     ? string.Format("已丢弃 {0} 个未完成任务，本地残留已清理（释放 {1}），网盘文件保留。",
                         n, Util.FormatSize(freed))
@@ -3890,6 +4072,196 @@ namespace GeZi
             Log(string.Format("开始续传 {0} 个任务…", chosen.Count));
             Tabs.SelectedIndex = 1;
             _ = ResumePendingBatchAsync(chosen);
+        }
+
+        /// <summary>
+        /// 【2026-10-13 新增】「未完成的任务」的**兼容模式**（极简降级窗口）。
+        ///
+        /// <para>【背景】原作者仓库 issue #8：用户环境下这个对话框会白屏 ——
+        /// 窗口框架、标题栏、最小化/最大化/关闭按钮都正常，内容区却整片纯白。
+        /// 因为它是**模态**的，用户既看不到内容也无法操作，等于整个程序被一个白窗口
+        /// 挡住；重启后弹的还是它，于是"再也进不去"。</para>
+        ///
+        /// <para>【为什么另写一个而不是复用】正常版用了主题资源刷（AppBgBrush 等）、
+        /// DWM 深色标题栏、以及代码构造的 DataTemplate。渲染环境异常时，这些环节
+        /// 每一个都可能是诱因或放大器。兼容模式**刻意只用最基础的 WPF 元素**：
+        /// 不查任何资源字典、不调任何 DWM、不做任何数据绑定，颜色全部写死 ——
+        /// 目标只有一个："一定能画出来"。</para>
+        ///
+        /// <para>【功能取舍】兼容模式只提供「继续下载」与「稍后再说」：不做逐项勾选
+        /// （列表以纯文本展示），也不提供「丢弃任务」。它是**保命通道** ——
+        /// 让用户至少能把续传跑起来，而不是被白窗口彻底挡在门外；
+        /// 磁盘清理这类事可以稍后在正常界面上从容处理。</para>
+        /// </summary>
+        private void ShowPendingFallbackAndApply(List<PendingTask> all, List<PendingTask> resumable)
+        {
+            bool doResume = false;
+            try
+            {
+                // ⚠️ 全部显式指定颜色与字号：不依赖当前主题 —— 避免"主题/渲染链路出问题"
+                //    这件事在降级路径上重演。深色字 + 浅色底，任何环境下都看得清。
+                var bg = System.Windows.Media.Brushes.White;
+                var fg = System.Windows.Media.Brushes.Black;
+                var subtle = new System.Windows.Media.SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0x5A, 0x5A, 0x5A));
+                var lineBrush = new System.Windows.Media.SolidColorBrush(
+                    System.Windows.Media.Color.FromRgb(0xC8, 0xC8, 0xC8));
+
+                var w = new Window
+                {
+                    Title = "未完成的任务（兼容模式）",
+                    Width = 620,
+                    Height = 460,
+                    MinWidth = 420,
+                    MinHeight = 300,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                    Owner = this,
+                    ShowInTaskbar = false,
+                    Background = bg,
+                    Foreground = fg,
+                    // 不查 AppFontFamily，用系统默认字体
+                    FontSize = 13,
+                };
+
+                var root = new DockPanel { LastChildFill = true, Margin = new Thickness(18) };
+
+                // ---- 按钮行**先**加（停靠到底边），保证窗口被压得很小时也一定可见 ----
+                var btnRow = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Margin = new Thickness(0, 14, 0, 0),
+                };
+                var resumeBtn = new Button
+                {
+                    Content = "继续下载全部可续传任务",
+                    Padding = new Thickness(16, 6, 16, 6),
+                    MinWidth = 180,
+                    IsEnabled = resumable.Count > 0,
+                };
+                var laterBtn = new Button
+                {
+                    Content = "稍后再说",
+                    Padding = new Thickness(16, 6, 16, 6),
+                    MinWidth = 90,
+                    Margin = new Thickness(10, 0, 0, 0),
+                };
+                btnRow.Children.Add(resumeBtn);
+                btnRow.Children.Add(laterBtn);
+                DockPanel.SetDock(btnRow, Dock.Bottom);
+                root.Children.Add(btnRow);
+
+                // ---- 标题 + 说明 ----
+                var head = new StackPanel();
+                head.Children.Add(new TextBlock
+                {
+                    Text = "未完成的任务",
+                    FontSize = 17,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = fg,
+                });
+                head.Children.Add(new TextBlock
+                {
+                    Text = string.Format(
+                        "检测到本机图形渲染异常，已自动切换到兼容模式。\n"
+                        + "上次有 {0} 个任务未完成，其中 {1} 个可以继续下载。\n"
+                        + "点「继续下载」会重新获取直链，接着已下载的部分继续（不会重下）。",
+                        all.Count, resumable.Count),
+                    TextWrapping = TextWrapping.Wrap,
+                    Foreground = subtle,
+                    Margin = new Thickness(0, 10, 0, 12),
+                });
+                DockPanel.SetDock(head, Dock.Top);
+                root.Children.Add(head);
+
+                // ---- 任务清单：纯文本，不做勾选（兼容模式刻意保持简单） ----
+                var list = new TextBlock { TextWrapping = TextWrapping.Wrap };
+                foreach (var p in all)
+                {
+                    string line = "· " + (p?.Name ?? "(未知)");
+                    if (p != null && p.Size > 0)
+                        line += "   " + Util.FormatSize(p.Size);
+                    if (p == null || !p.CanResume)
+                        line += "   （信息不全，需重新下载）";
+                    list.Inlines.Add(new System.Windows.Documents.Run(line)
+                    {
+                        Foreground = fg,
+                    });
+                    list.Inlines.Add(new System.Windows.Documents.LineBreak());
+                }
+                root.Children.Add(new ScrollViewer
+                {
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    BorderBrush = lineBrush,
+                    BorderThickness = new Thickness(1),
+                    Padding = new Thickness(10),
+                    Content = list,
+                });
+
+                w.Content = root;
+
+                resumeBtn.Click += (s, e) => { doResume = true; w.Close(); };
+                laterBtn.Click += (s, e) => { w.Close(); };
+
+                // ---- 兼容模式同样要防"再白屏" ----
+                // 若连最朴素的窗口都渲染不出来，问题已超出本程序能自救的范围；
+                // 此时**必须**自动关闭，否则用户会被彻底锁死（连主界面都点不到）。
+                bool ok = false;
+                w.ContentRendered += (s, e) => { ok = true; };
+                var guard = new System.Windows.Threading.DispatcherTimer(
+                    TimeSpan.FromSeconds(10),
+                    System.Windows.Threading.DispatcherPriority.Normal,
+                    (s, e) =>
+                    {
+                        ((System.Windows.Threading.DispatcherTimer)s).Stop();
+                        if (ok || !w.IsVisible) return;
+                        Log("兼容模式窗口也未能完成渲染（10 秒超时），已自动关闭。"
+                            + "任务记录不会丢失：可在下载页工具栏点「未完成任务」随时找回。");
+                        try { w.Close(); } catch { }
+                    },
+                    Dispatcher);
+                guard.Start();
+                try { w.ShowDialog(); } finally { guard.Stop(); }
+            }
+            catch (Exception ex)
+            {
+                // 降级路径都失败了 —— 绝不能把异常抛出去，更不能把用户卡住。
+                Log("兼容模式对话框构建失败（已跳过，不影响其它功能）: " + ex.Message);
+                return;
+            }
+
+            // ---- 处理用户选择 ----
+            // 注意：这里**没有**"丢弃"分支 —— 兼容模式不提供该功能（见方法注释的取舍）。
+            if (!doResume)
+            {
+                Log("未完成的任务已保留记录（兼容模式：未做任何操作）。"
+                    + "稍后可从下载页重新下载，分片在会自然续传。");
+                return;
+            }
+
+            if (resumable.Count == 0)
+            {
+                Log("没有可续传的任务。");
+                return;
+            }
+
+            // 批量续传前的确认（与正常模式同一套判据：一次性取链太多会被服务端风控）。
+            if (resumable.Count > ConfirmThreshold)
+            {
+                var ans = AppDialog.Show(this,
+                    string.Format("将续传 {0} 个任务，会一次性发出相应数量的取链请求。\n\n确认继续吗？",
+                        resumable.Count),
+                    "确认续传", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
+                if (ans != MessageBoxResult.Yes)
+                {
+                    Log("已取消批量续传。");
+                    return;
+                }
+            }
+
+            Log(string.Format("开始续传 {0} 个任务（兼容模式：全部可续传项）…", resumable.Count));
+            Tabs.SelectedIndex = 1;
+            _ = ResumePendingBatchAsync(resumable);
         }
 
         /// <summary>

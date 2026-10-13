@@ -757,6 +757,28 @@
 
                         <!-- 操作按钮 -->
                         <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,12,0,0">
+                            <!-- 【2026-10-13 新增】未完成任务的**首要入口**（下载页）。
+                                 背景：启动时那个模态的续传对话框在某些渲染环境下会白屏
+                                 （issue #8「续传界面卡白屏，再也进不去」）；它一旦白屏，
+                                 用户就再也没有办法找到并续传未完成任务了。
+                                 为什么放在**最左边**而不是这一行末尾：程序启动后默认停在下载页，
+                                 用户从白屏回到界面时第一眼就该看到它；而这一行右侧已被那句
+                                 「获取直链后可导出为 …」的说明文字占满，放在末尾会被挤出可视区。
+                                 用 Visibility 而非隐藏来控制 —— Collapsed 时完全不占布局，
+                                 没有未完成任务时对原有排版零影响。 -->
+                            <Button x:Name="PendingBtnHome" Click="OnOpenPending"
+                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"
+                                    Visibility="Collapsed"
+                                    ToolTip="查看并续传上次未完成的任务">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconClock}" Stretch="Uniform" Width="14"
+                                          Height="14" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.9"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    <TextBlock x:Name="PendingBtnHomeText" Text="未完成任务" Margin="7,0,0,0"
+                                               VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
                             <Button x:Name="DownloadSelBtn" Click="OnDownloadSelected"
                                     Style="{StaticResource PrimaryButton}" Margin="0,0,8,0">
                                 <StackPanel Orientation="Horizontal">
@@ -844,6 +866,25 @@
                                     Style="{StaticResource ToolButton}"/>
                             <Button x:Name="ClearDoneBtn" Content="清空已完成" Click="OnClearDone"
                                     Style="{StaticResource ToolButton}"/>
+                            <!-- 【2026-10-13 新增】「未完成任务」的常驻入口。
+                                 背景：这个入口原来**只有**启动时自动弹出的那个模态对话框，
+                                 一旦弹窗因环境异常（渲染失败等）出问题，用户就再也没有
+                                 办法找到并续传未完成任务（issue #8「续传界面卡白屏，再也进不去」）。
+                                 现在改为"弹窗照常 + 常驻按钮兜底"：只要还有未完成任务记录，
+                                 这个按钮就显示（带数量），随时可以打开同一个续传对话框。
+                                 无未完成任务时隐藏。 -->
+                            <Button x:Name="PendingBtn" Click="OnOpenPending" Style="{StaticResource ToolButton}"
+                                    Visibility="Collapsed"
+                                    ToolTip="查看并续传上次未完成的任务">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconClock}" Stretch="Uniform" Width="12"
+                                          Height="12" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    <TextBlock x:Name="PendingBtnText" Text="未完成任务" Margin="6,0,0,0"
+                                               VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
                             <Button x:Name="HistoryBtn" Click="OnOpenHistory" Style="{StaticResource ToolButton}">
                                 <StackPanel Orientation="Horizontal">
                                     <Path Data="{StaticResource IconHistory}" Stretch="Uniform" Width="12"

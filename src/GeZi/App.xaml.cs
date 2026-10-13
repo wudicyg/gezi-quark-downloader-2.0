@@ -32,6 +32,14 @@ namespace GeZi
         private Mutex _instanceMutex;
 
         /// <summary>
+        /// 【诊断用】本次启动是否因"检测到远程桌面会话"而强制切到了软件渲染。
+        /// 由 <see cref="OnStartup"/> 设置；MainWindow 启动时会写一行日志。
+        /// 这样用户反馈界面异常时，日志里能直接看出渲染环境，不必反复追问
+        /// （"你是不是在用远程桌面/多显示器"这类问题）。
+        /// </summary>
+        internal static bool SoftwareRenderingForced { get; private set; }
+
+        /// <summary>
         /// 跨进程「请把主窗拉起来」消息号。用 RegisterWindowMessage 注册，
         /// 保证同一台机器上所有 GeZi 实例拿到同一个值（≥0xC000 的区间，不会与系统消息冲突）。
         /// </summary>
@@ -66,6 +74,39 @@ namespace GeZi
         protected override void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
+
+            // ---------------- 【2026-10-13 新增】渲染环境自适应 ----------------
+            //
+            // 背景：原作者仓库 issue #8「重启后的续传界面卡白屏，再也进不去」。
+            // 用户截图显示：窗口标题栏、最小化/最大化/关闭按钮都正常，内容区却是
+            // **整片纯白**（深色主题下本该是深灰）—— 说明主题资源根本没参与渲染，
+            // 窗口内容的**首帧从未提交给合成器**。
+            //
+            // 这类"框架正常、内容全白"属于 WPF 渲染层的经典故障，不是业务逻辑问题。
+            // 最容易被触发的环境是**远程桌面会话**：RDP 建立时 DirectX 设备可能创建
+            // 失败，会话断开/重连时渲染设备还会被整体重建；多显示器/异构 DPI 同样
+            // 会让渲染目标初始化异常。用户那张截图里窗口只有 594×480，也符合
+            // 小屏或远程桌面的特征。
+            //
+            // 处置：检测到 RDP 就直接切软件渲染，整条绕开 GPU 路径。
+            // 代价只是滚动/动画略柔一点（本程序是下载器，界面几乎不重绘），
+            // 换来的是"一定能画出来" —— 这个取舍在任何情况下都划算。
+            //
+            // ⚠️ ProcessRenderMode 必须在**任何窗口创建之前**设置才生效，
+            //    所以这里是唯一正确的时机（此时 MainWindow 还没构造）。
+            try
+            {
+                if (NativeMethods.GetSystemMetrics(NativeMethods.SM_REMOTESESSION) != 0)
+                {
+                    System.Windows.Media.RenderOptions.ProcessRenderMode =
+                        System.Windows.Interop.RenderMode.SoftwareOnly;
+                    SoftwareRenderingForced = true;
+                }
+            }
+            catch
+            {
+                // 探测本身失败不影响启动：保持 WPF 默认（自动选择）渲染模式
+            }
 
             // 启动期总兜底：任何构造/初始化异常都落盘，避免"闪退无痕迹"。
             // 同时保留原来的弹窗提示（用户能立刻知道出事了，而不是静默失败）。

@@ -28,6 +28,28 @@ namespace GeZi
     /// </summary>
     internal static class NativeMethods
     {
+        // ---------------- 显示/渲染环境探测 ----------------
+
+        /// <summary>
+        /// <c>GetSystemMetrics</c> 的索引：当前进程是否跑在**远程桌面会话**（RDP）里。
+        ///
+        /// 【为什么需要】WPF 在 RDP 会话下拿不到正常的硬件渲染路径：会话刚开始时
+        /// DirectX 设备可能创建失败，会话断开/重连时渲染设备还会被整体重建。
+        /// 已知的失败形态之一就是**窗口框架（含标题栏、按钮）正常显示、
+        /// 内容区却永远不提交首帧** —— 表现为整片纯白，与用户反馈的
+        /// 「续传界面卡白屏，再也进不去」（原作者仓库 issue #8）完全一致。
+        /// 检测到 RDP 时改用软件渲染，可整条绕开 GPU 路径。
+        /// </summary>
+        internal const int SM_REMOTESESSION = 0x1000;
+
+        /// <summary>
+        /// 读取一条系统度量。对 <see cref="SM_REMOTESESSION"/> 而言：
+        /// 返回非 0 表示当前会话是 RDP。
+        /// 这是 user32 的轻量查询，不需要窗口句柄，启动最早期即可安全调用。
+        /// </summary>
+        [DllImport("user32.dll")]
+        internal static extern int GetSystemMetrics(int nIndex);
+
         // ---------------- 文件删除（占用时登记重启后删除） ----------------
 
         internal const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
