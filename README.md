@@ -5,7 +5,7 @@
 > 基于 **.NET Framework 4.8 + WPF** 开发，**零 NuGet 依赖、可完全离线构建**。
 
 > 📌 维护说明：本仓库是社区维护分支，
-> 进行缺陷修复、增强与长期维护。**下载请 [Releases](https://github.com/wudicyg/gezi-quark-downloader-2.0/releases) 。
+> 进行缺陷修复、增强与长期维护。下载请 [Releases](https://github.com/wudicyg/gezi-quark-downloader-2.0/releases) 。
 
 <p align="center">
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
