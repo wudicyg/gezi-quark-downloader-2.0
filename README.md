@@ -4,9 +4,8 @@
 > 多线程分片下载、边下边播、多账号管理、深色模式。
 > 基于 **.NET Framework 4.8 + WPF** 开发，**零 NuGet 依赖、可完全离线构建**。
 
-> 📌 **维护说明**：本仓库是**社区维护分支**，经原作者
-> [huaotem-bot](https://github.com/huaotem-bot/gezi-quark-downloader) 授权后进行
-> 缺陷修复、增强与长期维护。**下载请以本仓库 [Releases](https://github.com/wudicyg/gezi-quark-downloader-2.0/releases) 为准**。
+> 📌 **维护说明**：本仓库是**社区维护分支**，
+> 进行缺陷修复、增强与长期维护。**下载请 [Releases](https://github.com/wudicyg/gezi-quark-downloader-2.0/releases) 。
 
 <p align="center">
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
@@ -155,23 +154,4 @@ GNU General Public License for more details.
 3. 请勿将本软件用于**商业用途**，或用于**侵犯他人版权 / 违反服务条款**的行为。
 4. 使用者应自行承担因使用本软件产生的一切后果，作者不承担任何责任。
 5. 下载的内容版权归原权利人所有，请遵守相关法律法规。
-
----
-
-## 🙏 致谢
-感谢 [ZXing.Net](https://github.com/micjahn/ZXing.Net/) 提供的二维码解码能力，
-以及 [Python](https://www.python.org/) 社区。
-
-开发过程中参考了若干开源下载器的公开文档与设计思路（未复制其源代码），
-在此一并致谢，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 第 5 节。
-
----
-
-## ☕ 赞赏支持
-
-如果这个项目对你有帮助，欢迎请作者喝杯咖啡 ☕
-
-<p align="center">
-  <img src="GeZi.png" width="260" alt="赞赏码">
-</p>
 
