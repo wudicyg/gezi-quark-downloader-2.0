@@ -1005,6 +1005,10 @@ namespace GeZi.Core.Download
                         int n = await stream.ReadAsync(buf, 0, buf.Length, cancel).ConfigureAwait(false);
                         if (n <= 0)
                             break;
+                        // 【2026-10-13】写盘前再查一次暂停闸门：原因与分片路径完全相同
+                        // （暂停瞬间在途的那次读会带数据返回，不拦就会写进去）。
+                        if (pause != null)
+                            await pause.WaitIfPausedAsync(cancel).ConfigureAwait(false);
                         await fs.WriteAsync(buf, 0, n, cancel).ConfigureAwait(false);
                         done += n;
                         // 节流：单线程路径按 200ms 报一次进度，避免高速下载时 UI 被刷爆
@@ -1952,11 +1956,31 @@ namespace GeZi.Core.Download
                         // ---- 慢连接抢占：每 5 秒采样一次 ----
                         // 与诊断日志同频但**独立计时**：抢占是功能性逻辑，
                         // 不该因为诊断日志将来被调整/注释掉就跟着一起停。
-                        if (!draining && (now - lastPreempt).TotalSeconds >= PreemptTickSec)
+                        //
+                        // 【2026-10-13】暂停期间不采样、不抢占：用户暂停时本来就没有数据，
+                        // 采样必然全"慢"，掐了也是白掐 —— 只会变成"掐掉重连、再掐掉再重连"的
+                        // 空转（用户日志里暂停期间反复出现的「慢连接抢占: 本轮掐掉 1 路」就是这个）。
+                        if (!draining && (pause == null || !pause.IsPaused)
+                            && (now - lastPreempt).TotalSeconds >= PreemptTickSec)
                         {
                             lastPreempt = now;
                             try { PreemptSlowChunks(speed); }
                             catch { /* 抢占失败绝不能影响下载本身 */ }
+                        }
+
+                        // 【2026-10-13】暂停期间把"最后收到数据"的基线滚动到当前时刻。
+                        //
+                        // 暂停时连接静默是**预期行为**，不是假死；但 wLastGainMs 冻结在
+                        // 暂停前的旧时刻，暂停多久、恢复后就会误判多久（实测：暂停 20 秒
+                        // 恢复后，40+ 条健康连接在 0.85 秒内被集体判「已 35 秒没有收到
+                        // 任何数据」并掐掉重连 —— 明明一次都没坏）。
+                        // 滚动刷新后，恢复时假死计时从"这一刻"重新起算。
+                        if (pause != null && pause.IsPaused)
+                        {
+                            long nowP = NowMs();
+                            for (int i = 0; i < wCurPart.Length; i++)
+                                if (Volatile.Read(ref wCurPart[i]) >= 0)
+                                    Volatile.Write(ref wLastGainMs[i], nowP);
                         }
 
                         // 每 5 秒采一次样（结构化快照给诊断面板用）。
@@ -2383,8 +2407,35 @@ namespace GeZi.Core.Download
                             await Task.Delay(TimeSpan.FromMilliseconds(staggerMs), cancelToken).ConfigureAwait(false);
                         }
 
-                        while (queue.TryDequeue(out int idx))
+                        while (true)
                         {
+                            // 【2026-10-13 新增】领新分片之前先过暂停闸门：暂停期间不建连、不发请求。
+                            //
+                            // 没有这道闸门时，worker 会把队列里的分片一片片领出来、
+                            // 建连、发请求，直到读循环第一步才撞上暂停闸门 —— 白占一堆连接
+                            // （诊断面板里「活跃连接」在暂停期间不降就是这个原因），
+                            // 恢复时还会一次性撞上服务端的并发风控。
+                            if (pause != null)
+                            {
+                                try
+                                {
+                                    await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    // 暂停期间用户按了取消：先按「已取消」记账再退出。
+                                    // 直接 return 的话 cancelled 标志不会置位，调度器就会把
+                                    // 这个还没下完的任务当成「成功」上报 —— 比不修更糟。
+                                    Interlocked.Exchange(ref cancelled, 1);
+                                    if (cancel.IsCancellationRequested)
+                                        Interlocked.Exchange(ref userCancelled, 1);
+                                    return;
+                                }
+                            }
+
+                            if (!queue.TryDequeue(out int idx))
+                                break;
+
                             await gate.WaitAsync(cancelToken).ConfigureAwait(false);
                             bool gateTaken = true;
                             // 片级取消源：抢占只掐这一片，不牵连全局取消语义。
@@ -2552,6 +2603,23 @@ namespace GeZi.Core.Download
                                             int n = await stream.ReadAsync(buf, 0, buf.Length, partToken).ConfigureAwait(false);
                                             if (n <= 0)
                                                 break;
+                                            // 【2026-10-13 修·用户报「点暂停后进度条还在涨」】
+                                            // 写盘前**必须**再查一次暂停闸门。
+                                            //
+                                            // 只在"读之前"查是不够的：暂停那一刻正卡在 ReadAsync 里的
+                                            // 那一次读，会带着数据正常返回（.NET Framework 的内容流读取
+                                            // 不响应取消令牌，见 wResp 注释），于是这 n 个字节照样写盘、
+                                            // done 照样累加、进度条照样往前跑。
+                                            // 实测（真实夸克 CDN，64 路，暂停于 96%）：
+                                            //   暂停后又写进了 0.5~1.2 MB 才停住；
+                                            //   用户现场（尾部 40+ 路慢片在飞）更是整整 8.87 MB
+                                            //   在 29 秒里陆续落盘，任务自己把自己「跑完」了 ——
+                                            //   界面却一直显示「暂停中…」，用户看到的就是「暂停根本没用」。
+                                            //
+                                            // 闸门放在写之前，暂停生效后一个字节都不会再落盘；
+                                            // 已经读到的这批数据留在 buf 里，恢复后原样写入，不浪费。
+                                            if (pause != null)
+                                                await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
                                             await wfs.WriteAsync(buf, 0, n, partToken).ConfigureAwait(false);
                                                             written += n;
                                                             part.W = written;
